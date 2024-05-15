@@ -10,46 +10,25 @@
 //! [1]: https://www.sensirion.com/fileadmin/user_upload/customers/sensirion/Dokumente/0_Datasheets/Particulate_Matter/Sensirion_PM_Sensors_SPS30_Datasheet.pdf
 
 #![deny(unsafe_code)]
-#![deny(missing_docs)]
-#![no_std]
+#![cfg_attr(not(target_os = "linux"), no_std)]
 
-use arrayvec::ArrayVec;
-use core::convert::From;
-use ieee754::*;
-use nb::Error as nbError;
-use sensirion_hdlc::{decode, encode, HDLCError, SpecialChars};
+use core::{fmt, mem};
+
+use embedded_hal_async::delay::DelayNs;
+use embedded_io_async::{Read, Write};
+use heapless::{String, Vec};
+
+mod error;
+mod hldc;
+mod read_frame;
+pub use error::Error;
+use read_frame::read_frame;
 
 /// Max characters to read for a frame detection
-const MAX_BUFFER: usize = 600;
+const MAX_ENCODED_FRAME_SIZE: usize = 2 * (10 * mem::size_of::<f32>() + 5 + 2);
+const MAX_DECODED_FRAME_SIZE: usize = 10 * mem::size_of::<f32>() + 5 + 2;
 
-/// Errors for this crate
-#[derive(Debug)]
-pub enum Error<E, F> {
-    /// Serial bus read error
-    SerialR(nb::Error<F>),
-    /// Serial bus write error
-    SerialW(E),
-    /// SHDLC decode error
-    SHDLC(HDLCError),
-    /// No valid frame read.
-    ///
-    /// Input function read more than 600 characters without seeing two 0x7e
-    InvalidFrame,
-    /// Result is empty
-    EmptyResult,
-    /// Checksum failed, after shdlc decode
-    ChecksumFailed,
-    /// Response is for another CommandType
-    InvalidRespose,
-    /// Device returned an Error (State field of MISO Frame is not 0)
-    StatusError,
-}
-
-impl<E, F> From<nbError<F>> for Error<E, F> {
-    fn from(f: nbError<F>) -> Self {
-        Error::SerialR(f)
-    }
-}
+const ADDR: u8 = 0;
 
 /// Types of information device holds
 #[repr(u8)]
@@ -81,8 +60,65 @@ pub enum CommandType {
     Reset = 0xD3,
 }
 
+#[derive(Debug)]
+#[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(defmt::Format)]
+pub struct Measurement {
+    /// Mass Concentration PM1.0 [μg/m³]
+    mass_pm1_0: f32,
+    /// Mass Concentration PM2.5 [μg/m³]
+    mass_pm2_5: f32,
+    /// Mass Concentration PM4.0 [μg/m³]
+    mass_pm4_0: f32,
+    /// Mass Concentration PM10 [μg/m³]
+    mass_pm10: f32,
+    /// Number Concentration PM0.5 [#/cm³]
+    mass_pm0_5: f32,
+    /// Number Concentration PM1.0 [#/cm³]
+    number_pm1_0: f32,
+    /// Number Concentration PM2.5 [#/cm³]
+    number_pm2_5: f32,
+    /// Number Concentration PM4.0 [#/cm³]
+    number_pm4_0: f32,
+    /// Number Concentration PM10 [#/cm³]
+    number_pm10: f32,
+    /// Typical Particle Size8 [μm]
+    typical_particle_size: f32,
+}
+
+struct NotEnoughData;
+impl Measurement {
+    fn from_floats(mut floats: impl Iterator<Item = f32>) -> Option<Self> {
+        Some(Self {
+            mass_pm1_0: floats.next()?,
+            mass_pm2_5: floats.next()?,
+            mass_pm4_0: floats.next()?,
+            mass_pm10: floats.next()?,
+            mass_pm0_5: floats.next()?,
+            number_pm1_0: floats.next()?,
+            number_pm2_5: floats.next()?,
+            number_pm4_0: floats.next()?,
+            number_pm10: floats.next()?,
+            typical_particle_size: floats.next()?,
+        })
+    }
+
+    pub(crate) fn from_frame(frame: &[u8]) -> Result<Self, NotEnoughData> {
+        let data = &frame[5..frame.len() - 2];
+        // array_chunks would be nice here (not yet stable)
+        let floats = data
+            .chunks_exact(mem::size_of::<f32>())
+            .map(<[u8; mem::size_of::<f32>()]>::try_from)
+            .map(Result::unwrap) // chunks exact guarantees correct size
+            .map(f32::from_be_bytes);
+
+        Self::from_floats(floats).ok_or(NotEnoughData)
+    }
+}
+
 /// Checksum implemented as per section 4.1 from spec
-fn compute_cksum(data: &[u8]) -> u8 {
+fn checksum(data: &[u8]) -> u8 {
     let mut cksum: u8 = 0;
     for &byte in data.iter() {
         let val: u16 = cksum as u16 + byte as u16;
@@ -93,306 +129,278 @@ fn compute_cksum(data: &[u8]) -> u8 {
     255 - cksum
 }
 
-/// Sps30 driver
-#[derive(Debug, Default)]
-pub struct Sps30<SERIAL> {
-    /// The concrete Serial device implementation.
-    serial: SERIAL,
+macro_rules! checksummed {
+    ($($byte:expr),*) => {
+        {
+            let mut input = [$($byte),*, 0u8];
+            let checksum = checksum(&input[..input.len() -1]);
+            input[input.len() - 1] = checksum;
+            input
+        }
+    };
 }
 
-impl<SERIAL, E, F> Sps30<SERIAL>
+macro_rules! cmd {
+    ($cmd:expr$(, [$($data:expr),*])?) => {
+        {
+            let mut input = [ADDR, $cmd, 0u8, $($($data),*,)? 0u8];
+            let data_length = input.len() - 4;
+            input[2] = data_length as u8;
+
+            let checksum = checksum(&input[..input.len() -1]);
+            input[input.len() - 1] = checksum;
+            input
+        }
+    };
+}
+
+/// Perform checks on MISO Frame
+///
+/// Start
+///  ADR     CMD       State    Length    RX Data          CHK     Stop      
+///  0x7E   1 Byte   1 Byte    1 Byte    0...255 bytes    1 Byte   0x7E
+fn parse_miso_frame<TxError, RxError>(
+    frame: &[u8],
+    cmd_type: CommandType,
+) -> Result<&[u8], Error<TxError, RxError>>
 where
-    SERIAL: embedded_hal::blocking::serial::Write<u8, Error = E>
-        + embedded_hal::serial::Read<u8, Error = F>,
+    RxError: defmt::Format + fmt::Debug,
+    TxError: defmt::Format + fmt::Debug,
 {
-    /// Create new instance of the Sps30 device
-    pub fn new(serial: SERIAL) -> Self {
-        Sps30 { serial }
+    let [0x7e, _, cmd, state, length, data @ .., 0x7e] = frame else {
+        return Err(Error::InvalidResponse);
+    };
+
+    if *cmd != cmd_type as u8 {
+        return Err(Error::InvalidResponse);
+    }
+    if *state != 0 {
+        return Err(Error::StatusError(*state));
+    }
+
+    if *length as usize != data.len() {
+        return Err(Error::InvalidResponse);
+    }
+
+    Ok(data)
+}
+
+fn check_miso_frame<TxError, RxError>(
+    frame: &[u8],
+    cmd_type: CommandType,
+) -> Result<(), Error<TxError, RxError>>
+where
+    RxError: defmt::Format + fmt::Debug,
+    TxError: defmt::Format + fmt::Debug,
+{
+    parse_miso_frame(frame, cmd_type)?;
+    Ok(())
+}
+
+/// Sps30 driver
+pub struct Sps30<const UART_BUF: usize, Tx, Rx, D> {
+    /// The concrete Serial device implementation.
+    uart_tx: Tx,
+    uart_rx: Rx,
+    delay: D,
+}
+
+impl<const UART_BUF: usize, Tx, Rx, D> Sps30<UART_BUF, Tx, Rx, D>
+where
+    Tx: Write,
+    Tx::Error: defmt::Format,
+    Rx: Read,
+    Rx::Error: defmt::Format,
+    D: DelayNs,
+{
+    /// Constructs the [`Sps30`] interface from 2 'halves' of UART.
+    /// # Warning, take care to setup the UART with the correct settings:
+    /// - Baudrate: 115200
+    /// - Date bits: 8 bits
+    /// - Stop bits: 1 bit
+    /// - Parity: None
+    ///
+    /// # Warning
+    /// If the uart is bufferd the UART_BUF const generic must be
+    /// larger then the buffer provided to the uart
+    pub fn from_tx_rx(uart_tx: Tx, uart_rx: Rx, delay: D) -> Sps30<UART_BUF, Tx, Rx, D> {
+        Self {
+            uart_tx,
+            uart_rx,
+            delay,
+        }
     }
 
     /// Send data through serial interface
-    fn send_uart_data(&mut self, data: &[u8]) -> Result<(), Error<E, F>> {
-        let s_chars = SpecialChars::default();
-        let output = encode(&data, s_chars).unwrap();
-        //extern crate std;
-        //std::println!("Write {:x?}", output);
-        self.serial.bwrite_all(&output).map_err(Error::SerialW)
+    async fn send_uart_data(&mut self, data: &[u8]) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const LARGEST_REQUEST_FRAME: usize = 2 + 4 + 2; // header, data, footer
+        let output = hldc::encode::<LARGEST_REQUEST_FRAME>(data).unwrap();
+        self.uart_tx
+            .write_all(&output)
+            .await
+            .map_err(Error::SerialW)
     }
 
     /// Read from serial until two 0x7e are seen
     ///
-    /// No more than MAX_BUFFER=600 u8 will be read
+    /// No more than MAX_ENCODED_FRAME_SIZE bytes will be read
     /// After a MISO Frame is received, result is SHDLC decoded
     /// Checksum for decoded frame is verified
-    fn read_uart_data(&mut self) -> Result<ArrayVec<[u8; 1024]>, Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
+    async fn read_uart_data(
+        &mut self,
+    ) -> Result<Vec<u8, MAX_DECODED_FRAME_SIZE>, Error<Tx::Error, Rx::Error>> {
+        let frame: Vec<u8, MAX_ENCODED_FRAME_SIZE> =
+            match read_frame::<UART_BUF, MAX_ENCODED_FRAME_SIZE, Rx>(&mut self.uart_rx).await {
+                Ok(frame) => frame,
+                Err(read_frame::Error::Eof) => return Err(Error::ReadingEOF),
+                Err(read_frame::Error::Read(e)) => return Err(Error::SerialR(e)),
+                Err(read_frame::Error::BufferOutOfSpace) => return Err(Error::FrameTooLarge),
+            };
 
-        let mut seen = 0;
-        while seen != 2 {
-            let byte = self.serial.read();
-            match byte {
-                Ok(value) => {
-                    if value == 0x7e {
-                        seen += 1;
-                    }
-                    output.push(value);
-                }
-                Err(e) => {
-                    return Err(Error::from(e));
-                }
-            }
-            if output.len() > MAX_BUFFER {
-                return Err(Error::InvalidFrame);
-            }
-        }
-
-        match decode(&output, SpecialChars::default()) {
-            Ok(v) => {
-                if v[v.len() - 1] == compute_cksum(&v[..v.len() - 1]) {
-                    return Ok(v);
-                }
-
-                Err(Error::ChecksumFailed)
-            }
-            Err(e) => Err(Error::SHDLC(e)),
+        let decoded = hldc::decode(&frame).map_err(Error::SHDLC)?;
+        if decoded[decoded.len() - 1] == checksum(&decoded[..decoded.len() - 1]) {
+            Ok(decoded)
+        } else {
+            Err(Error::ChecksumFailed)
         }
     }
 
-    /// Perform checks on MISO Frame
-    ///  * lenght >=5
-    ///  * CMD must match sent MOSI Frame CMD
-    ///  * State should be 0 (No Error)
-    ///  * L(ength) must be valid
-    fn check_miso_frame<'a>(
-        &self,
-        data: &'a [u8],
-        cmd_type: CommandType,
-    ) -> Result<&'a [u8], Error<E, F>> {
-        if data.len() < 5 {
-            return Err(Error::InvalidRespose);
-        }
+    /// Starts the measurement. After power up, the module is in Idle-Mode.
+    /// Before any measurement values can be read, the Measurement-Mode needs to
+    /// be started using this function.
+    pub async fn start_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x00;
+        const SUBCMD: u8 = 0x01;
+        const FORMAT_FLOAT: u8 = 0x03;
+        let cmd = cmd!(CMD, [SUBCMD, FORMAT_FLOAT]);
+        self.send_uart_data(&cmd).await?;
 
-        if data[1] != cmd_type as u8 {
-            return Err(Error::InvalidRespose);
-        }
-        if data[2] != 0 {
-            return Err(Error::StatusError);
-        }
-
-        if data[3] as usize != data.len() - 5 {
-            return Err(Error::InvalidRespose);
-        }
-
-        //extern crate std;
-        //std::println!("Read: {:x?}", &data);
-        Ok(data)
+        let response = self.read_uart_data().await?;
+        check_miso_frame(&response, CommandType::StartMeasurement)
     }
 
-    /// Start measuring
-    pub fn start_measurement(&mut self) -> Result<(), Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x00, 0x02, 0x01, 0x03];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
+    /// Stop measuring. Use this command to return to the initial state (Idle-Mode).
+    pub async fn stop_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x01;
+        let cmd = cmd!(CMD);
+        self.send_uart_data(&cmd).await?;
 
-        match self.read_uart_data() {
-            Ok(response) => self
-                .check_miso_frame(&response, CommandType::StartMeasurement)
-                .map(|_| ()),
+        match self.read_uart_data().await {
+            Ok(response) => check_miso_frame(&response, CommandType::StopMeasurement).map(|_| ()),
             Err(e) => Err(e),
         }
     }
 
-    /// Stop measuring
-    pub fn stop_measurement(&mut self) -> Result<(), Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x01, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
-
-        match self.read_uart_data() {
-            Ok(response) => self
-                .check_miso_frame(&response, CommandType::StopMeasurement)
-                .map(|_| ()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Read measuring
-    pub fn read_measurement(&mut self) -> Result<[f32; 10], Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x03, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&cmd));
-        self.send_uart_data(&output)?;
-
-        let data = self.read_uart_data();
-
-        let mut res: [f32; 10] = [0.0; 10];
-        match data {
-            Ok(v) => match v.len() {
-                45 => {
-                    self.check_miso_frame(&v, CommandType::ReadMeasuredData)?;
-                    for i in 0..res.len() {
-                        let mut bits: u32 = 0;
-                        for &byte in v[4 + 4 * i..4 + 4 * (i + 1)].iter() {
-                            bits = (bits << 8) + byte as u32;
-                        }
-                        res[i] = Ieee754::from_bits(bits);
-                    }
-                    Ok(res)
-                }
-                5 => Err(Error::EmptyResult),
-                _ => Err(Error::InvalidFrame),
-            },
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Read cleaning interval
-    pub fn read_cleaning_interval(&mut self) -> Result<u32, Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x80, 0x01, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
-
-        match self.read_uart_data() {
-            Ok(response) => {
-                match self.check_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval) {
-                    Ok(v) => {
-                        if v[3] != 4 {
-                            return Err(Error::InvalidRespose);
-                        }
-
-                        let mut ret: u32 = 0;
-                        for &byte in v[4..8].iter() {
-                            ret = ret * 256 + byte as u32;
-                        }
-                        Ok(ret)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Write cleaning interval
-    pub fn write_cleaning_interval(&mut self, val: u32) -> Result<(), Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x80, 0x05, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        for item in &val.to_be_bytes() {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
-
-        match self.read_uart_data() {
-            Ok(response) => {
-                match self.check_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval) {
-                    Ok(v) => {
-                        if v[3] != 0 {
-                            return Err(Error::InvalidRespose);
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Start fan cleaning
-    pub fn start_fan_cleaning(&mut self) -> Result<(), Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0x56, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
-
-        match self.read_uart_data() {
-            Ok(response) => self
-                .check_miso_frame(&response, CommandType::StartFanCleaning)
-                .map(|_| ()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Get info
+    /// Read result. If no new measurement values are available, the module
+    /// returns an empty response frame Reads the measured values from the
+    /// module. This command can be used to poll for new measurement values. The
+    /// measurement interval is 1 second.
     ///
-    /// Return a [u8;32] with info
-    pub fn device_info(&mut self, info: DeviceInfo) -> Result<[u8; 32], Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0xD0, 0x01];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(info as u8);
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
+    /// returns None if data is not yet ready
+    pub async fn read_measurement(
+        &mut self,
+    ) -> Result<Option<Measurement>, Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x03;
+        let cmd = cmd!(CMD);
+        self.send_uart_data(&cmd).await?;
 
-        match self.read_uart_data() {
-            Ok(response) => {
-                match self.check_miso_frame(&response, CommandType::DeviceInformation) {
-                    Ok(val) => {
-                        let mut ret: [u8; 32] = [0; 32];
-                        if val[3] < 33 {
-                            for i in 0..val[3] {
-                                ret[i as usize] = val[3 + i as usize];
-                            }
-                            return Ok(ret);
-                        }
-                        Err(Error::EmptyResult)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
+        let data = self.read_uart_data().await?;
+        check_miso_frame(&data, CommandType::ReadMeasuredData)?;
+        Ok(Some(
+            Measurement::from_frame(&data).map_err(|_| Error::InvalidMeasurement)?,
+        ))
+    }
+
+    /// Read cleaning interval, of the periodic fan-cleaning. Interval in
+    /// seconds as big-endian unsigned 32-bit integer value.
+    pub async fn read_cleaning_interval(&mut self) -> Result<u32, Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x80;
+        const SUB_CMD: u8 = 0x00;
+        let cmd = cmd!(CMD, [SUB_CMD]);
+        self.send_uart_data(&cmd).await?;
+
+        let response = self.read_uart_data().await?;
+        let data = parse_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval)?;
+        let data: [u8; 4] = data
+            .try_into()
+            .map_err(|_| Error::InvalidCleaningInterval)?;
+        let ret = u32::from_be_bytes(data);
+        Ok(ret)
+    }
+
+    /// Write cleaning interval of the periodic fan-cleaning. Interval in
+    /// seconds as big-endian unsigned 32-bit integer value. Default is 168
+    /// hours ±3% due to clock drift. Once set, the interval is stored
+    /// permanently in the non-volatile memory. If the sensor is switched off,
+    /// the time counter is reset to 0. Make sure to trigger a cleaning cycle at
+    /// least every week if the sensor is switched off and on periodically
+    /// (e.g., once per day).
+    ///
+    /// The cleaning procedure can also be started manually with
+    /// [`start_fan_cleaning`](Self::start_fan_cleaning).
+    pub async fn write_cleaning_interval(
+        &mut self,
+        val: u32,
+    ) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x80;
+        // wrong in datasheet spec correct in datasheet example
+        const SUB_CMD: u8 = 0x05;
+
+        let interval = val.to_be_bytes();
+        let cmd = cmd!(
+            CMD,
+            [SUB_CMD, interval[0], interval[1], interval[2], interval[3]]
+        );
+        self.send_uart_data(&cmd).await?;
+
+        let response = self.read_uart_data().await?;
+        check_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval)?;
+        if response[3] != 0 {
+            Err(Error::InvalidResponse)
+        } else {
+            Ok(())
         }
+    }
+
+    /// Start fan cleaning manually. This will accelerate the fan to maximum
+    /// speed for 10 seconds in order to blow out the dust accumulated inside
+    /// the fan.
+    pub async fn start_fan_cleaning(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0x56;
+        let cmd = cmd!(CMD);
+        self.send_uart_data(&cmd).await?;
+
+        let response = self.read_uart_data().await?;
+        check_miso_frame(&response, CommandType::StartFanCleaning)
+    }
+
+    /// Gets version information about the firmware, hardware, and SHDLC protocol
+    pub async fn serial_number(&mut self) -> Result<String<32>, Error<Tx::Error, Rx::Error>> {
+        const CMD: u8 = 0xD0;
+        const SUB_CMD: u8 = 0x03;
+        let cmd = cmd!(CMD, [SUB_CMD]);
+        self.send_uart_data(&cmd).await?;
+
+        let response = self.read_uart_data().await?;
+        let data = parse_miso_frame(&response, CommandType::DeviceInformation)?;
+
+        let mut serial = Vec::new();
+        serial
+            .extend_from_slice(data)
+            .map_err(|()| Error::FrameTooLarge)?;
+        String::from_utf8(serial).map_err(|_| Error::SerialInvalidUtf8)
     }
 
     /// Reset device
     ///
-    /// After calling this function, caller must sleep before issuing more commands
-    pub fn reset(&mut self) -> Result<(), Error<E, F>> {
-        let mut output = ArrayVec::<[u8; 1024]>::new();
-        let cmd = [0x00, 0xD3, 0x00];
-        for item in &cmd {
-            output.push(*item);
-        }
-        output.push(compute_cksum(&output));
-        self.send_uart_data(&output)?;
+    /// Will block for 20 ms while the reset is occurring
+    pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        let cmd = checksummed![0x00, 0xD3, 0x00];
+        self.send_uart_data(&cmd).await?;
 
-        match self.read_uart_data() {
-            Ok(response) => self
-                .check_miso_frame(&response, CommandType::Reset)
-                .map(|_| ()),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+        let response = self.read_uart_data().await?;
+        check_miso_frame(&response, CommandType::Reset)?;
+        self.delay.delay_ms(20).await;
+        Ok(())
     }
 }
