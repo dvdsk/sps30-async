@@ -16,13 +16,13 @@ use core::{fmt, mem};
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_io_async::{Read, Write};
-use error::DeviceError;
 use heapless::{String, Vec};
 
 mod error;
 mod hldc;
+pub use hldc::Error as HldcError;
 mod read_frame;
-pub use error::Error;
+pub use error::{Error, DeviceError};
 use read_frame::read_frame;
 
 /// Max characters to read for a frame detection
@@ -54,25 +54,25 @@ enum Command {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(defmt::Format)]
 pub struct Measurement {
-    /// Mass Concentration PM1.0 [μg/m³]
+    /// Mass Concentration PM1.0 \[μg/m³\]
     pub mass_pm1_0: f32,
-    /// Mass Concentration PM2.5 [μg/m³]
+    /// Mass Concentration PM2.5 \[μg/m³\]
     pub mass_pm2_5: f32,
-    /// Mass Concentration PM4.0 [μg/m³]
+    /// Mass Concentration PM4.0 \[μg/m³\]
     pub mass_pm4_0: f32,
-    /// Mass Concentration PM10 [μg/m³]
+    /// Mass Concentration PM10 \[μg/m³\]
     pub mass_pm10: f32,
-    /// Number Concentration PM0.5 [#/cm³]
+    /// Number Concentration PM0.5 \[#/cm³\]
     pub mass_pm0_5: f32,
-    /// Number Concentration PM1.0 [#/cm³]
+    /// Number Concentration PM1.0 \[#/cm³\]
     pub number_pm1_0: f32,
-    /// Number Concentration PM2.5 [#/cm³]
+    /// Number Concentration PM2.5 \[#/cm³\]
     pub number_pm2_5: f32,
-    /// Number Concentration PM4.0 [#/cm³]
+    /// Number Concentration PM4.0 \[#/cm³\]
     pub number_pm4_0: f32,
-    /// Number Concentration PM10 [#/cm³]
+    /// Number Concentration PM10 \[#/cm³\]
     pub number_pm10: f32,
-    /// Typical Particle Size8 [μm]
+    /// Typical Particle Size8 \[μm\]
     pub typical_particle_size: f32,
 }
 
