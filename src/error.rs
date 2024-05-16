@@ -86,7 +86,7 @@ in a frame without seeing frame markers"
     /// Checksum failed, after shdlc decode
     #[cfg_attr(feature = "thiserror", error("Checksum failed, after shdlc decode"))]
     ChecksumFailed,
-    /// Response is for another [`Command`] then what we send
+    /// Response is for another command then what we send
     #[cfg_attr(
         feature = "thiserror",
         error("Response is for another Command then what we send")

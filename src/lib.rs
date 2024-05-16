@@ -55,25 +55,25 @@ enum Command {
 #[derive(defmt::Format)]
 pub struct Measurement {
     /// Mass Concentration PM1.0 [μg/m³]
-    mass_pm1_0: f32,
+    pub mass_pm1_0: f32,
     /// Mass Concentration PM2.5 [μg/m³]
-    mass_pm2_5: f32,
+    pub mass_pm2_5: f32,
     /// Mass Concentration PM4.0 [μg/m³]
-    mass_pm4_0: f32,
+    pub mass_pm4_0: f32,
     /// Mass Concentration PM10 [μg/m³]
-    mass_pm10: f32,
+    pub mass_pm10: f32,
     /// Number Concentration PM0.5 [#/cm³]
-    mass_pm0_5: f32,
+    pub mass_pm0_5: f32,
     /// Number Concentration PM1.0 [#/cm³]
-    number_pm1_0: f32,
+    pub number_pm1_0: f32,
     /// Number Concentration PM2.5 [#/cm³]
-    number_pm2_5: f32,
+    pub number_pm2_5: f32,
     /// Number Concentration PM4.0 [#/cm³]
-    number_pm4_0: f32,
+    pub number_pm4_0: f32,
     /// Number Concentration PM10 [#/cm³]
-    number_pm10: f32,
+    pub number_pm10: f32,
     /// Typical Particle Size8 [μm]
-    typical_particle_size: f32,
+    pub typical_particle_size: f32,
 }
 
 struct NotEnoughData;
