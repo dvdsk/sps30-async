@@ -28,17 +28,12 @@ use read_frame::read_frame;
 /// Max characters to read for a frame detection
 const MAX_ENCODED_FRAME_SIZE: usize = 2 * (10 * mem::size_of::<f32>() + 5 + 2);
 const MAX_DECODED_FRAME_SIZE: usize = 10 * mem::size_of::<f32>() + 5 + 2;
-
 const ADDR: u8 = 0;
 
-/// Types of information device holds
 #[repr(u8)]
-pub enum DeviceInfo {
-    /// Product Name
-    ProductName = 1,
-    /// Article Code
-    ArticleCode = 2,
-    /// Serial Number
+enum DeviceInfo {
+    // ProductName = 1,
+    // ArticleCode = 2,
     SerialNumber = 3,
 }
 
