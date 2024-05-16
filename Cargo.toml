@@ -1,9 +1,9 @@
 [package]
-name = "sps30"
-authors = ["Ioan Herisanu <ioan.herisanu.dev@gmail.com>"]
+name = "sps30-async"
+authors = ["David Kleingeld <open-source@davidsk.dev>"]
 categories = ["no-std"]
-description = "Sensirion SPS30 Particulate Matter Sensor"
-documentation = "https://docs.rs/sps30"
+description = "Async driver for Sensirion SPS30 Particulate Matter Sensor"
+documentation = "https://docs.rs/sps30-async"
 keywords = ["Sensirion", "SPS30"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
