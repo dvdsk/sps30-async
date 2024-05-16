@@ -16,6 +16,7 @@ use core::{fmt, mem};
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_io_async::{Read, Write};
+use error::DeviceError;
 use heapless::{String, Vec};
 
 mod error;
@@ -41,22 +42,15 @@ pub enum DeviceInfo {
     SerialNumber = 3,
 }
 
-/// Available commands
 #[repr(u8)]
-pub enum CommandType {
-    /// Start measurement
+enum Command {
     StartMeasurement = 0,
-    /// Stop measurement
     StopMeasurement = 1,
-    ///  Read measurement
     ReadMeasuredData = 3,
-    /// Read/Write Auto Cleaning Interval
+    /// Read or Write Auto Cleaning Interval
     ReadWriteAutoCleaningInterval = 0x80,
-    /// Start Fan Cleaning
     StartFanCleaning = 0x56,
-    /// Device Information
     DeviceInformation = 0xD0,
-    /// Reset
     Reset = 0xD3,
 }
 
@@ -118,9 +112,11 @@ impl Measurement {
 }
 
 /// Checksum implemented as per section 4.1 from spec
+#[allow(clippy::cast_lossless)]
+#[allow(clippy::cast_possible_truncation)]
 fn checksum(data: &[u8]) -> u8 {
     let mut cksum: u8 = 0;
-    for &byte in data.iter() {
+    for &byte in data {
         let val: u16 = cksum as u16 + byte as u16;
         let lsb = val % 256;
         cksum = lsb as u8;
@@ -129,21 +125,10 @@ fn checksum(data: &[u8]) -> u8 {
     255 - cksum
 }
 
-macro_rules! checksummed {
-    ($($byte:expr),*) => {
-        {
-            let mut input = [$($byte),*, 0u8];
-            let checksum = checksum(&input[..input.len() -1]);
-            input[input.len() - 1] = checksum;
-            input
-        }
-    };
-}
-
 macro_rules! cmd {
     ($cmd:expr$(, [$($data:expr),*])?) => {
         {
-            let mut input = [ADDR, $cmd, 0u8, $($($data),*,)? 0u8];
+            let mut input = [ADDR, $cmd as u8, 0u8, $($($data),*,)? 0u8];
             let data_length = input.len() - 4;
             input[2] = data_length as u8;
 
@@ -161,7 +146,7 @@ macro_rules! cmd {
 ///  0x7E   1 Byte   1 Byte    1 Byte    0...255 bytes    1 Byte   0x7E
 fn parse_miso_frame<TxError, RxError>(
     frame: &[u8],
-    cmd_type: CommandType,
+    cmd_type: Command,
 ) -> Result<&[u8], Error<TxError, RxError>>
 where
     RxError: defmt::Format + fmt::Debug,
@@ -175,7 +160,8 @@ where
         return Err(Error::InvalidResponse);
     }
     if *state != 0 {
-        return Err(Error::StatusError(*state));
+        let dev_err = DeviceError::from(*state);
+        return Err(Error::DeviceError(dev_err));
     }
 
     if *length as usize != data.len() {
@@ -187,7 +173,7 @@ where
 
 fn check_miso_frame<TxError, RxError>(
     frame: &[u8],
-    cmd_type: CommandType,
+    cmd_type: Command,
 ) -> Result<(), Error<TxError, RxError>>
 where
     RxError: defmt::Format + fmt::Debug,
@@ -221,7 +207,7 @@ where
     /// - Parity: None
     ///
     /// # Warning
-    /// If the uart is bufferd the UART_BUF const generic must be
+    /// If the uart is bufferd the `UART_BUF` const generic must be
     /// larger then the buffer provided to the uart
     pub fn from_tx_rx(uart_tx: Tx, uart_rx: Rx, delay: D) -> Sps30<UART_BUF, Tx, Rx, D> {
         Self {
@@ -241,11 +227,7 @@ where
             .map_err(Error::SerialW)
     }
 
-    /// Read from serial until two 0x7e are seen
-    ///
-    /// No more than MAX_ENCODED_FRAME_SIZE bytes will be read
-    /// After a MISO Frame is received, result is SHDLC decoded
-    /// Checksum for decoded frame is verified
+    /// Reads the latest available frame from serial, decodes it and verifies the checksum
     async fn read_uart_data(
         &mut self,
     ) -> Result<Vec<u8, MAX_DECODED_FRAME_SIZE>, Error<Tx::Error, Rx::Error>> {
@@ -268,25 +250,35 @@ where
     /// Starts the measurement. After power up, the module is in Idle-Mode.
     /// Before any measurement values can be read, the Measurement-Mode needs to
     /// be started using this function.
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn start_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x00;
+        const CMD: Command = Command::StartMeasurement;
         const SUBCMD: u8 = 0x01;
         const FORMAT_FLOAT: u8 = 0x03;
         let cmd = cmd!(CMD, [SUBCMD, FORMAT_FLOAT]);
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        check_miso_frame(&response, CommandType::StartMeasurement)
+        check_miso_frame(&response, CMD)
     }
 
     /// Stop measuring. Use this command to return to the initial state (Idle-Mode).
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn stop_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x01;
+        const CMD: Command = Command::StopMeasurement;
         let cmd = cmd!(CMD);
         self.send_uart_data(&cmd).await?;
 
         match self.read_uart_data().await {
-            Ok(response) => check_miso_frame(&response, CommandType::StopMeasurement).map(|_| ()),
+            Ok(response) => check_miso_frame(&response, CMD),
             Err(e) => Err(e),
         }
     }
@@ -297,33 +289,43 @@ where
     /// measurement interval is 1 second.
     ///
     /// returns None if data is not yet ready
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn read_measurement(
         &mut self,
     ) -> Result<Option<Measurement>, Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x03;
+        const CMD: Command = Command::ReadMeasuredData;
         let cmd = cmd!(CMD);
         self.send_uart_data(&cmd).await?;
 
         let data = self.read_uart_data().await?;
-        check_miso_frame(&data, CommandType::ReadMeasuredData)?;
+        check_miso_frame(&data, CMD)?;
         Ok(Some(
-            Measurement::from_frame(&data).map_err(|_| Error::InvalidMeasurement)?,
+            Measurement::from_frame(&data).map_err(|_| Error::MeasurementDataTooShort)?,
         ))
     }
 
     /// Read cleaning interval, of the periodic fan-cleaning. Interval in
     /// seconds as big-endian unsigned 32-bit integer value.
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn read_cleaning_interval(&mut self) -> Result<u32, Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x80;
+        const CMD: Command = Command::ReadWriteAutoCleaningInterval;
         const SUB_CMD: u8 = 0x00;
         let cmd = cmd!(CMD, [SUB_CMD]);
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        let data = parse_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval)?;
+        let data = parse_miso_frame(&response, CMD)?;
         let data: [u8; 4] = data
             .try_into()
-            .map_err(|_| Error::InvalidCleaningInterval)?;
+            .map_err(|_| Error::CleaningIntervalDataTooShort)?;
         let ret = u32::from_be_bytes(data);
         Ok(ret)
     }
@@ -338,11 +340,16 @@ where
     ///
     /// The cleaning procedure can also be started manually with
     /// [`start_fan_cleaning`](Self::start_fan_cleaning).
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn write_cleaning_interval(
         &mut self,
         val: u32,
     ) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x80;
+        const CMD: Command = Command::ReadWriteAutoCleaningInterval;
         // wrong in datasheet spec correct in datasheet example
         const SUB_CMD: u8 = 0x05;
 
@@ -354,7 +361,7 @@ where
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        check_miso_frame(&response, CommandType::ReadWriteAutoCleaningInterval)?;
+        check_miso_frame(&response, CMD)?;
         if response[3] != 0 {
             Err(Error::InvalidResponse)
         } else {
@@ -365,24 +372,34 @@ where
     /// Start fan cleaning manually. This will accelerate the fan to maximum
     /// speed for 10 seconds in order to blow out the dust accumulated inside
     /// the fan.
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn start_fan_cleaning(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0x56;
+        const CMD: Command = Command::StartFanCleaning;
         let cmd = cmd!(CMD);
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        check_miso_frame(&response, CommandType::StartFanCleaning)
+        check_miso_frame(&response, CMD)
     }
 
     /// Gets version information about the firmware, hardware, and SHDLC protocol
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn serial_number(&mut self) -> Result<String<32>, Error<Tx::Error, Rx::Error>> {
-        const CMD: u8 = 0xD0;
-        const SUB_CMD: u8 = 0x03;
+        const CMD: Command = Command::DeviceInformation;
+        const SUB_CMD: u8 = DeviceInfo::SerialNumber as u8;
         let cmd = cmd!(CMD, [SUB_CMD]);
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        let data = parse_miso_frame(&response, CommandType::DeviceInformation)?;
+        let data = parse_miso_frame(&response, CMD)?;
 
         let mut serial = Vec::new();
         serial
@@ -394,12 +411,18 @@ where
     /// Reset device
     ///
     /// Will block for 20 ms while the reset is occurring
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
     pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        let cmd = checksummed![0x00, 0xD3, 0x00];
+        const CMD: Command = Command::Reset;
+        let cmd = cmd!(CMD);
         self.send_uart_data(&cmd).await?;
 
         let response = self.read_uart_data().await?;
-        check_miso_frame(&response, CommandType::Reset)?;
+        check_miso_frame(&response, CMD)?;
         self.delay.delay_ms(20).await;
         Ok(())
     }

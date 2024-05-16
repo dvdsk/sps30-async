@@ -1,4 +1,56 @@
+#![allow(clippy::module_name_repetitions)]
 use core::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(defmt::Format)]
+pub enum DeviceError {
+    /// Wrong data length for last command (too much or little data)
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Wrong data length for last command (too much or little data)")
+    )]
+    WrongDataLen,
+    /// Unknown command
+    #[cfg_attr(feature = "thiserror", error("Unknown command"))]
+    UnknownCmd,
+    /// No access right for command
+    #[cfg_attr(feature = "thiserror", error("No access right for command"))]
+    NoAccess,
+    /// Illegal command parameter or parameter out of allowed range
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Illegal command parameter or parameter out of allowed range")
+    )]
+    InvalidParam,
+    /// Internal function argument out of range
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Internal function argument out of range")
+    )]
+    InternalOutOfRange,
+    /// Command not allowed in current state
+    #[cfg_attr(feature = "thiserror", error("Command not allowed in current state"))]
+    InvalidStateForCommand,
+    /// Undocumented error code
+    #[cfg_attr(feature = "thiserror", error("Undocumented error code"))]
+    Unknown,
+}
+
+impl From<u8> for DeviceError {
+    fn from(error_code: u8) -> Self {
+        match error_code {
+            1 => Self::WrongDataLen,
+            2 => Self::UnknownCmd,
+            3 => Self::NoAccess,
+            4 => Self::InvalidParam,
+            40 => Self::InternalOutOfRange,
+            67 => Self::InvalidStateForCommand,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[derive(Debug)]
 #[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
@@ -34,27 +86,27 @@ in a frame without seeing frame markers"
     /// Checksum failed, after shdlc decode
     #[cfg_attr(feature = "thiserror", error("Checksum failed, after shdlc decode"))]
     ChecksumFailed,
-    /// Response is for another CommandType
-    #[cfg_attr(feature = "thiserror", error("Response is for another CommandType"))]
-    InvalidResponse,
-    /// Device returned an Error (State field of MISO Frame is not 0)
+    /// Response is for another [`Command`] then what we send
     #[cfg_attr(
         feature = "thiserror",
-        error("Device returned an Error (State field of MISO Frame is not 0)")
+        error("Response is for another Command then what we send")
     )]
-    StatusError(u8),
+    InvalidResponse,
+    /// Device returned an error
+    #[cfg_attr(feature = "thiserror", error("Device returned error: {0}"))]
+    DeviceError(DeviceError),
     /// The data send in response to read measurement was too short
     #[cfg_attr(
         feature = "thiserror",
         error("The data send in response to read measurement was too short")
     )]
-    InvalidMeasurement,
+    MeasurementDataTooShort,
     /// The data send as cleaning interval is too short.
     #[cfg_attr(
         feature = "thiserror",
         error("The data send as cleaning interval is too short.")
     )]
-    InvalidCleaningInterval,
+    CleaningIntervalDataTooShort,
     /// Serial number should be a utf8 string it is not
     #[cfg_attr(
         feature = "thiserror",
@@ -62,10 +114,7 @@ in a frame without seeing frame markers"
     )]
     SerialInvalidUtf8,
     /// Unexpected EOF is uart disconnected?
-    #[cfg_attr(
-        feature = "thiserror",
-        error("Unexpected EOF is uart disconnected?")
-    )]
+    #[cfg_attr(feature = "thiserror", error("Unexpected EOF is uart disconnected?"))]
     ReadingEOF,
     /// Frame is too large, either a bug or something went wrong with uart.
     #[cfg_attr(
@@ -89,9 +138,9 @@ where
             Error::EmptyResult => Error::EmptyResult,
             Error::ChecksumFailed => Error::ChecksumFailed,
             Error::InvalidResponse => Error::InvalidResponse,
-            Error::StatusError(s) => Error::StatusError(s.clone()),
-            Error::InvalidMeasurement => Error::InvalidMeasurement,
-            Error::InvalidCleaningInterval => Error::InvalidCleaningInterval,
+            Error::DeviceError(s) => Error::DeviceError(s.clone()),
+            Error::MeasurementDataTooShort => Error::MeasurementDataTooShort,
+            Error::CleaningIntervalDataTooShort => Error::CleaningIntervalDataTooShort,
             Error::SerialInvalidUtf8 => Error::SerialInvalidUtf8,
             Error::ReadingEOF => Error::ReadingEOF,
             Error::FrameTooLarge => Error::FrameTooLarge,
@@ -116,15 +165,15 @@ where
             (Error::SerialR(e), Error::SerialR(e2)) => e == e2,
             (Error::SerialW(e), Error::SerialW(e2)) => e == e2,
             (Error::SHDLC(e), Error::SHDLC(e2)) => e == e2,
-            (Error::StatusError(s1), Error::StatusError(s2)) => s1 == s2,
+            (Error::DeviceError(s1), Error::DeviceError(s2)) => s1 == s2,
             (Error::InvalidFrame, Error::InvalidFrame)
             | (Error::FrameTooLarge, Error::FrameTooLarge)
             | (Error::ReadingEOF, Error::ReadingEOF)
             | (Error::EmptyResult, Error::EmptyResult)
             | (Error::ChecksumFailed, Error::ChecksumFailed)
-            | (Error::InvalidCleaningInterval, Error::InvalidCleaningInterval)
+            | (Error::CleaningIntervalDataTooShort, Error::CleaningIntervalDataTooShort)
             | (Error::SerialInvalidUtf8, Error::SerialInvalidUtf8)
-            | (Error::InvalidMeasurement, Error::InvalidMeasurement) => true,
+            | (Error::MeasurementDataTooShort, Error::MeasurementDataTooShort) => true,
             (_, _) => false,
         }
     }

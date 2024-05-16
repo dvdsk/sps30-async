@@ -3,6 +3,9 @@ use heapless::Vec;
 
 use crate::hldc;
 
+// TODO in future versions use use ReadReady trait to remove need for huge UART buffer
+// currently ReadReady is not implemented by most hall implementations
+
 /// goal
 /// resync and be fault tolerant
 ///  - recognise *xxx* x less then 5 as start of new package
@@ -10,7 +13,6 @@ use crate::hldc;
 /// reject old frame if start of a newer read has been read
 ///  - any trailing character invalidates previous package
 ///
-/// TODO use ReadReady trait to remove need for huge UART buffer
 pub(crate) async fn read_frame<const UART_BUF_SIZE: usize, const FRAME_CAPACITY: usize, Rx>(
     rx: &mut Rx,
 ) -> Result<Vec<u8, FRAME_CAPACITY>, Error<Rx::Error>>
@@ -60,19 +62,18 @@ where
                 frame.clear();
                 frame.extend_from_slice(&read[before_last..=last_marker])?;
                 return Ok(frame);
-            } else {
-                // got bytes past complete package, reject
-                continue;
             }
-        } else {
-            // new package starts at last_marker
-            frame.clear();
-            frame.extend_from_slice(dbg!(&read[last_marker..]))?;
-            match find_end(rx, &mut frame, &mut buf).await {
-                FindEndResult::PackageFinished => return Ok(frame),
-                FindEndResult::PackageOutdated => continue,
-                FindEndResult::ReadError(err) => return Err(err),
-            }
+            // got bytes past complete package, reject
+            continue;
+        }
+
+        // new package starts at last_marker
+        frame.clear();
+        frame.extend_from_slice(dbg!(&read[last_marker..]))?;
+        match find_end(rx, &mut frame, &mut buf).await {
+            FindEndResult::PackageFinished => return Ok(frame),
+            FindEndResult::PackageOutdated => continue,
+            FindEndResult::ReadError(err) => return Err(err),
         }
     }
 }
@@ -94,7 +95,7 @@ impl<RxError: defmt::Format + core::fmt::Debug> From<u8> for Error<RxError> {
 }
 
 impl<RxError: defmt::Format + core::fmt::Debug> From<()> for Error<RxError> {
-    fn from(_: ()) -> Self {
+    fn from((): ()) -> Self {
         Error::BufferOutOfSpace
     }
 }
@@ -118,13 +119,13 @@ where
     Rx::Error: defmt::Format,
 {
     let body = match rx.read(buf).await {
-        Ok(n) if n == 0 => return FindEndResult::ReadError(Error::Eof),
+        Ok(0) => return FindEndResult::ReadError(Error::Eof),
         Ok(n) => &buf[..n],
         Err(e) => return FindEndResult::ReadError(Error::Read(e)),
     };
 
     if *body.last().unwrap() == hldc::FRAME_BOUNDARY_MARKER {
-        if let Err(_) = frame.extend_from_slice(body) {
+        if let Err(()) = frame.extend_from_slice(body) {
             return FindEndResult::ReadError(Error::BufferOutOfSpace);
         }
         FindEndResult::PackageFinished
