@@ -69,7 +69,7 @@ where
 
         // new package starts at last_marker
         frame.clear();
-        frame.extend_from_slice(dbg!(&read[last_marker..]))?;
+        frame.extend_from_slice(&read[last_marker..])?;
         match find_end(rx, &mut frame, &mut buf).await {
             FindEndResult::PackageFinished => return Ok(frame),
             FindEndResult::PackageOutdated => continue,
