@@ -10,7 +10,7 @@
 //! [1]: https://www.sensirion.com/fileadmin/user_upload/customers/sensirion/Dokumente/0_Datasheets/Particulate_Matter/Sensirion_PM_Sensors_SPS30_Datasheet.pdf
 
 #![deny(unsafe_code)]
-#![cfg_attr(not(target_os = "linux"), no_std)]
+#![cfg_attr(not(any(target_os = "linux", feature = "thiserror")), no_std)]
 
 use core::{fmt, mem};
 
@@ -22,7 +22,7 @@ mod error;
 mod hldc;
 pub use hldc::Error as HldcError;
 mod read_frame;
-pub use error::{Error, DeviceError};
+pub use error::{DeviceError, Error};
 use read_frame::read_frame;
 
 /// Max characters to read for a frame detection
@@ -50,7 +50,6 @@ enum Command {
 }
 
 #[derive(Debug)]
-#[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(defmt::Format)]
 pub struct Measurement {
@@ -93,8 +92,7 @@ impl Measurement {
         })
     }
 
-    pub(crate) fn from_frame(frame: &[u8]) -> Result<Self, NotEnoughData> {
-        let data = &frame[5..frame.len() - 2];
+    pub(crate) fn from_data(data: &[u8]) -> Result<Self, NotEnoughData> {
         // array_chunks would be nice here (not yet stable)
         let floats = data
             .chunks_exact(mem::size_of::<f32>())
@@ -134,7 +132,7 @@ macro_rules! cmd {
     };
 }
 
-/// Perform checks on MISO Frame
+/// Perform checks on decoded MISO Frame
 ///
 /// Start
 ///  ADR     CMD       State    Length    RX Data          CHK     Stop      
@@ -147,9 +145,20 @@ where
     RxError: defmt::Format + fmt::Debug,
     TxError: defmt::Format + fmt::Debug,
 {
-    let [0x7e, _, cmd, state, length, data @ .., 0x7e] = frame else {
+    const ADDR: u8 = 0x00;
+    let [ADDR, cmd, state, length, data @ .., check_sum] = frame else {
         return Err(Error::InvalidResponse);
     };
+    defmt::trace!("frame: {:?}", frame);
+    defmt::trace!("cmd: {}, state: {}, length: {}", cmd, state, length);
+    defmt::trace!("data len: {}", data.len());
+
+    let [without_checksum @ .., _] = frame else {
+        unreachable!()
+    };
+    if *check_sum != checksum(without_checksum) {
+        return Err(Error::ChecksumFailed);
+    }
 
     if *cmd != cmd_type as u8 {
         return Err(Error::InvalidResponse);
@@ -204,26 +213,36 @@ where
     /// # Warning
     /// If the uart is bufferd the `UART_BUF` const generic must be
     /// larger then the buffer provided to the uart
-    pub fn from_tx_rx(uart_tx: Tx, uart_rx: Rx, delay: D) -> Sps30<UART_BUF, Tx, Rx, D> {
-        Self {
+    pub async fn from_tx_rx(
+        uart_tx: Tx,
+        uart_rx: Rx,
+        delay: D,
+    ) -> Result<Sps30<UART_BUF, Tx, Rx, D>, Error<Tx::Error, Rx::Error>> {
+        let mut instance = Self {
             uart_tx,
             uart_rx,
             delay,
-        }
+        };
+        instance.reset().await?;
+        instance.start_measurement().await?;
+        Ok(instance)
     }
 
     /// Send data through serial interface
-    async fn send_uart_data(&mut self, data: &[u8]) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        const LARGEST_REQUEST_FRAME: usize = 2 + 4 + 2; // header, data, footer
-        let output = hldc::encode::<LARGEST_REQUEST_FRAME>(data).unwrap();
+    async fn encode_and_send(&mut self, data: &[u8]) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        const LARGEST_ENCODED_REQUEST_FRAME: usize = 2 * (2 + 4 + 2); // header, data, footer
+        let output = hldc::encode::<LARGEST_ENCODED_REQUEST_FRAME>(data)
+            .await
+            .unwrap();
         self.uart_tx
             .write_all(&output)
             .await
-            .map_err(Error::SerialW)
+            .map_err(Error::SerialW)?;
+        self.uart_tx.flush().await.map_err(Error::SerialW)
     }
 
     /// Reads the latest available frame from serial, decodes it and verifies the checksum
-    async fn read_uart_data(
+    async fn receive_and_decode(
         &mut self,
     ) -> Result<Vec<u8, MAX_DECODED_FRAME_SIZE>, Error<Tx::Error, Rx::Error>> {
         let frame: Vec<u8, MAX_ENCODED_FRAME_SIZE> =
@@ -234,12 +253,9 @@ where
                 Err(read_frame::Error::BufferOutOfSpace) => return Err(Error::FrameTooLarge),
             };
 
-        let decoded = hldc::decode(&frame).map_err(Error::SHDLC)?;
-        if decoded[decoded.len() - 1] == checksum(&decoded[..decoded.len() - 1]) {
-            Ok(decoded)
-        } else {
-            Err(Error::ChecksumFailed)
-        }
+        hldc::decode(&frame)
+            .await
+            .map_err(Error::SHDLC)
     }
 
     /// Starts the measurement. After power up, the module is in Idle-Mode.
@@ -255,9 +271,9 @@ where
         const SUBCMD: u8 = 0x01;
         const FORMAT_FLOAT: u8 = 0x03;
         let cmd = cmd!(CMD, [SUBCMD, FORMAT_FLOAT]);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         check_miso_frame(&response, CMD)
     }
 
@@ -270,9 +286,9 @@ where
     pub async fn stop_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::StopMeasurement;
         let cmd = cmd!(CMD);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        match self.read_uart_data().await {
+        match self.receive_and_decode().await {
             Ok(response) => check_miso_frame(&response, CMD),
             Err(e) => Err(e),
         }
@@ -294,12 +310,12 @@ where
     ) -> Result<Option<Measurement>, Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::ReadMeasuredData;
         let cmd = cmd!(CMD);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let data = self.read_uart_data().await?;
+        let data = self.receive_and_decode().await?;
         check_miso_frame(&data, CMD)?;
         Ok(Some(
-            Measurement::from_frame(&data).map_err(|_| Error::MeasurementDataTooShort)?,
+            Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort)?,
         ))
     }
 
@@ -314,9 +330,9 @@ where
         const CMD: Command = Command::ReadWriteAutoCleaningInterval;
         const SUB_CMD: u8 = 0x00;
         let cmd = cmd!(CMD, [SUB_CMD]);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         let data = parse_miso_frame(&response, CMD)?;
         let data: [u8; 4] = data
             .try_into()
@@ -353,9 +369,9 @@ where
             CMD,
             [SUB_CMD, interval[0], interval[1], interval[2], interval[3]]
         );
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         check_miso_frame(&response, CMD)?;
         if response[3] != 0 {
             Err(Error::InvalidResponse)
@@ -375,9 +391,9 @@ where
     pub async fn start_fan_cleaning(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::StartFanCleaning;
         let cmd = cmd!(CMD);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         check_miso_frame(&response, CMD)
     }
 
@@ -391,9 +407,9 @@ where
         const CMD: Command = Command::DeviceInformation;
         const SUB_CMD: u8 = DeviceInfo::SerialNumber as u8;
         let cmd = cmd!(CMD, [SUB_CMD]);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         let data = parse_miso_frame(&response, CMD)?;
 
         let mut serial = Vec::new();
@@ -414,9 +430,9 @@ where
     pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::Reset;
         let cmd = cmd!(CMD);
-        self.send_uart_data(&cmd).await?;
+        self.encode_and_send(&cmd).await?;
 
-        let response = self.read_uart_data().await?;
+        let response = self.receive_and_decode().await?;
         check_miso_frame(&response, CMD)?;
         self.delay.delay_ms(20).await;
         Ok(())

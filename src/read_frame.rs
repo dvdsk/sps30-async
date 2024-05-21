@@ -22,7 +22,6 @@ where
 {
     let mut frame: Vec<u8, FRAME_CAPACITY> = Vec::new();
     // MUST be larger then any existing uart buffer
-    // // TODO: fix/remove requirement using read_ready <15-05-24, dvdsk>
     let mut buf = [0u8; UART_BUF_SIZE];
     let mut read;
 
@@ -30,11 +29,13 @@ where
         frame.clear();
 
         let last_marker = loop {
+            defmt::trace!("waiting to receive bytes");
             let n = rx.read(&mut buf).await.map_err(Error::Read)?;
             if n == 0 {
                 return Err(Error::Eof);
             }
             read = &buf[0..n];
+            defmt::trace!("read: {}", read);
 
             if let Some(last_marker) = read
                 .iter()
@@ -42,12 +43,15 @@ where
             {
                 break last_marker;
             }
+            defmt::debug!("did not find frame boundary in data");
         };
 
+        defmt::trace!("last_marker: {}", last_marker);
         let Some(before_last) = read[..last_marker]
             .iter()
             .rposition(|byte| *byte == hldc::FRAME_BOUNDARY_MARKER)
         else {
+            defmt::debug!("got partial frame, waiting for end to come in");
             frame.extend_from_slice(&read[last_marker..])?;
             match find_end(rx, &mut frame, &mut buf).await {
                 FindEndResult::PackageFinished => return Ok(frame),
@@ -55,6 +59,9 @@ where
                 FindEndResult::ReadError(err) => return Err(err),
             }
         };
+        defmt::trace!("marker before that: {}", before_last);
+        defmt::trace!("last - before last: {}", last_marker - before_last);
+        defmt::trace!("hldc::MIN_FRAME_SIZE: {}", hldc::MIN_FRAME_SIZE);
 
         if last_marker - before_last >= hldc::MIN_FRAME_SIZE {
             if last_marker == read.len() - 1 {
@@ -64,10 +71,12 @@ where
                 return Ok(frame);
             }
             // got bytes past complete package, reject
+            defmt::debug!("got bytes past frame end, might be new frame. Beginning again");
             continue;
         }
 
         // new package starts at last_marker
+        defmt::debug!("got partial frame, waiting for end to come in");
         frame.clear();
         frame.extend_from_slice(&read[last_marker..])?;
         match find_end(rx, &mut frame, &mut buf).await {
@@ -118,18 +127,33 @@ where
     Rx: Read,
     Rx::Error: defmt::Format,
 {
-    let body = match rx.read(buf).await {
-        Ok(0) => return FindEndResult::ReadError(Error::Eof),
-        Ok(n) => &buf[..n],
-        Err(e) => return FindEndResult::ReadError(Error::Read(e)),
+    let mut read;
+    let boundary = loop {
+        read = match rx.read(buf).await {
+            Ok(0) => return FindEndResult::ReadError(Error::Eof),
+            Ok(n) => &buf[..n],
+            Err(e) => return FindEndResult::ReadError(Error::Read(e)),
+        };
+
+        if let Some(first_boundary) = read
+            .iter()
+            .position(|byte| *byte == hldc::FRAME_BOUNDARY_MARKER)
+        {
+            break first_boundary;
+        }
+
+        if let Err(()) = frame.extend_from_slice(read) {
+            return FindEndResult::ReadError(Error::BufferOutOfSpace);
+        }
     };
 
-    if *body.last().unwrap() == hldc::FRAME_BOUNDARY_MARKER {
-        if let Err(()) = frame.extend_from_slice(body) {
+    if boundary == read.len() - 1 {
+        if let Err(()) = frame.extend_from_slice(read) {
             return FindEndResult::ReadError(Error::BufferOutOfSpace);
         }
         FindEndResult::PackageFinished
     } else {
+        defmt::debug!("got bytes past frame end, might be new frame. Beginning again");
         FindEndResult::PackageOutdated
     }
 }
@@ -142,20 +166,8 @@ mod test {
     use super::{read_frame, Error};
     use crate::hldc::FRAME_BOUNDARY_MARKER as FB;
     use core::convert::Infallible;
-    use embedded_io_async::{ErrorType, Read, Write};
+    use embedded_io_async::{ErrorType, Read};
     use futures::executor::block_on;
-
-    struct MockTx;
-
-    impl ErrorType for MockTx {
-        type Error = Infallible;
-    }
-
-    impl Write for MockTx {
-        async fn write(&mut self, _buf: &[u8]) -> Result<usize, Self::Error> {
-            unimplemented!()
-        }
-    }
 
     struct MockRx {
         curr_read: usize,
@@ -227,7 +239,7 @@ mod test {
 
     #[test]
     fn last_package_split() {
-        // read 1           read 2        no read 3
+        // read 1           read 2        read 3
         // -------        ----**----         -*
         let mut rx = MockRx {
             curr_read: 0,
@@ -243,8 +255,8 @@ mod test {
 
     #[test]
     fn huge_read() {
-        // read 1           read 2        no read 3
-        // -------        ----**----         -*
+        // read 1
+        // ------------------------------**------*
         let mut rx = MockRx {
             curr_read: 0,
             reads: &[&[
@@ -254,5 +266,37 @@ mod test {
         };
         let frame = block_on(read_frame::<40, 8, MockRx>(&mut rx)).unwrap();
         assert_eq!(&frame, &[FB, 1, 2, 3, 4, 5, 6, FB])
+    }
+
+    #[test]
+    fn end_in_many_small_reads() {
+        // read 1             read 2    read 3  ... read 12   read 13
+        // *---------------     -         -            -         *
+        let mut rx = MockRx {
+            curr_read: 0,
+            reads: &[
+                &[FB, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255, 22, 23, 24, 25],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[5],
+                &[FB],
+            ],
+        };
+        let frame = block_on(read_frame::<80, 80, MockRx>(&mut rx)).unwrap();
+        assert_eq!(
+            &frame,
+            &[
+                FB, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255, 22, 23, 24, 25, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                5, FB
+            ]
+        )
     }
 }
