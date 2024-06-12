@@ -203,7 +203,9 @@ where
     Rx::Error: defmt::Format,
     D: DelayNs,
 {
-    /// Constructs the [`Sps30`] interface from 2 'halves' of UART.
+    /// Constructs the [`Sps30`] interface from 2 'halves' of UART and
+    /// initializes the device.
+    ///
     /// # Warning, take care to setup the UART with the correct settings:
     /// - Baudrate: 115200
     /// - Date bits: 8 bits
@@ -228,7 +230,25 @@ where
         Ok(instance)
     }
 
+    /// Constructs the [`Sps30`] interface from 2 'halves' of UART.
+    ///
+    /// Does not initialize the device, take care to:
+    /// - Reset the device
+    /// - Start measurements
+    ///
+    /// Generally you want [`Self::from_tx_rx`] however this can be useful
+    /// in case you want to handle errors by retrying while having the
+    /// driver own the tx and rx.
+    pub fn from_tx_rx_uninit(uart_tx: Tx, uart_rx: Rx, delay: D) -> Sps30<UART_BUF, Tx, Rx, D> {
+        Self {
+            uart_tx,
+            uart_rx,
+            delay,
+        }
+    }
+
     /// Send data through serial interface
+    #[inline(always)]
     async fn encode_and_send(&mut self, data: &[u8]) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const LARGEST_ENCODED_REQUEST_FRAME: usize = 2 * (2 + 4 + 2); // header, data, footer
         let output = hldc::encode::<LARGEST_ENCODED_REQUEST_FRAME>(data)
@@ -242,6 +262,7 @@ where
     }
 
     /// Reads the latest available frame from serial, decodes it and verifies the checksum
+    #[inline(always)]
     async fn receive_and_decode(
         &mut self,
     ) -> Result<Vec<u8, MAX_DECODED_FRAME_SIZE>, Error<Tx::Error, Rx::Error>> {
@@ -253,9 +274,7 @@ where
                 Err(read_frame::Error::BufferOutOfSpace) => return Err(Error::FrameTooLarge),
             };
 
-        hldc::decode(&frame)
-            .await
-            .map_err(Error::SHDLC)
+        hldc::decode(&frame).await.map_err(Error::SHDLC)
     }
 
     /// Starts the measurement. After power up, the module is in Idle-Mode.
@@ -266,6 +285,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn start_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::StartMeasurement;
         const SUBCMD: u8 = 0x01;
@@ -283,6 +303,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn stop_measurement(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::StopMeasurement;
         let cmd = cmd!(CMD);
@@ -295,28 +316,23 @@ where
     }
 
     /// Read result. If no new measurement values are available, the module
-    /// returns an empty response frame Reads the measured values from the
-    /// module. This command can be used to poll for new measurement values. The
-    /// measurement interval is 1 second.
+    /// waits until one is. The measurement interval is 1 second.
     ///
-    /// returns None if data is not yet ready
+    /// This function like all in this driver is cancel safe
     ///
     /// # Errors
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
-    pub async fn read_measurement(
-        &mut self,
-    ) -> Result<Option<Measurement>, Error<Tx::Error, Rx::Error>> {
+    #[inline(always)]
+    pub async fn read_measurement(&mut self) -> Result<Measurement, Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::ReadMeasuredData;
         let cmd = cmd!(CMD);
         self.encode_and_send(&cmd).await?;
 
         let data = self.receive_and_decode().await?;
         check_miso_frame(&data, CMD)?;
-        Ok(Some(
-            Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort)?,
-        ))
+        Ok(Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort)?)
     }
 
     /// Read cleaning interval, of the periodic fan-cleaning. Interval in
@@ -326,6 +342,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn read_cleaning_interval(&mut self) -> Result<u32, Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::ReadWriteAutoCleaningInterval;
         const SUB_CMD: u8 = 0x00;
@@ -356,6 +373,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn write_cleaning_interval(
         &mut self,
         val: u32,
@@ -388,6 +406,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn start_fan_cleaning(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::StartFanCleaning;
         let cmd = cmd!(CMD);
@@ -403,6 +422,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn serial_number(&mut self) -> Result<String<32>, Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::DeviceInformation;
         const SUB_CMD: u8 = DeviceInfo::SerialNumber as u8;
@@ -427,6 +447,7 @@ where
     /// Reading the response can fail, the device can run into an internal
     /// error or the connection could have issues leading to invalid responses.
     /// These are caught and reported as Errors.
+    #[inline(always)]
     pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::Reset;
         let cmd = cmd!(CMD);
