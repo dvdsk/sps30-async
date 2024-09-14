@@ -62,7 +62,7 @@ pub struct Measurement {
     /// Mass Concentration PM10 \[μg/m³\]
     pub mass_pm10: f32,
     /// Number Concentration PM0.5 \[#/cm³\]
-    pub mass_pm0_5: f32,
+    pub number_pm0_5: f32,
     /// Number Concentration PM1.0 \[#/cm³\]
     pub number_pm1_0: f32,
     /// Number Concentration PM2.5 \[#/cm³\]
@@ -83,7 +83,7 @@ impl Measurement {
             mass_pm2_5: floats.next()?,
             mass_pm4_0: floats.next()?,
             mass_pm10: floats.next()?,
-            mass_pm0_5: floats.next()?,
+            number_pm0_5: floats.next()?,
             number_pm1_0: floats.next()?,
             number_pm2_5: floats.next()?,
             number_pm4_0: floats.next()?,
