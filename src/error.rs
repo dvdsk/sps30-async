@@ -1,6 +1,8 @@
 #![allow(clippy::module_name_repetitions)]
 use core::fmt;
 
+use crate::Command;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -73,6 +75,12 @@ where
     /// Device returned an error
     #[cfg_attr(feature = "thiserror", error("Device returned error: {0}"))]
     DeviceError(DeviceError),
+    /// Could not clear the RX buffer, ran into read error.
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Could not clear the RX buffer, bus read error: {0}")
+    )]
+    ClearingRxBuffer(RxError),
     /// No valid frame read. Input function read more than twice the max bytes
     /// in a frame without seeing frame markers
     #[cfg_attr(
@@ -92,9 +100,9 @@ in a frame without seeing frame markers"
     /// Response is for another command then what we send
     #[cfg_attr(
         feature = "thiserror",
-        error("Response is for another Command then what we send")
+        error("Response {got} is for another Command then what we send {expected}")
     )]
-    InvalidResponse,
+    InvalidResponse { expected: Command, got: Command },
     /// The data send in response to read measurement was too short
     #[cfg_attr(
         feature = "thiserror",
@@ -122,12 +130,34 @@ in a frame without seeing frame markers"
         error("Frame is too large, either a bug or something went wrong with uart.")
     )]
     FrameTooLarge,
+    /// Frame is too short, either a bug or something went wrong with uart.
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Frame is too short, either a bug or something went wrong with uart.")
+    )]
+    FrameTooShort,
     /// The sensor should have a measurement ready within 2 seconds it did not
     #[cfg_attr(
         feature = "thiserror",
         error("The sensor should have a measurement ready within 2 seconds it did not")
     )]
     NoMeasurementsToRead,
+    /// The command field of the response had an unknown value
+    #[cfg_attr(
+        feature = "thiserror",
+        error("The command field of the response had an unknown value: {command_code}")
+    )]
+    InvalidCommand { command_code: u8 },
+    /// The frame has a data length that does not match the actual length
+    /// of the data section
+    #[cfg_attr(
+        feature = "thiserror",
+        error(
+            "The frame has a data length that does not match the actual length \
+    of the data section"
+        )
+    )]
+    DataLengthMissMatch,
 }
 
 impl<TxError, RxError> Clone for Error<TxError, RxError>
@@ -141,16 +171,25 @@ where
             Error::SerialW(e) => Error::SerialW(e.clone()),
             Error::SHDLC(e) => Error::SHDLC(e.clone()),
             Error::DeviceError(s) => Error::DeviceError(s.clone()),
+            Error::ClearingRxBuffer(e) => Error::ClearingRxBuffer(e.clone()),
             Error::InvalidFrame => Error::InvalidFrame,
             Error::EmptyResult => Error::EmptyResult,
             Error::ChecksumFailed => Error::ChecksumFailed,
-            Error::InvalidResponse => Error::InvalidResponse,
+            Error::InvalidResponse { expected, got } => Error::InvalidResponse {
+                expected: *expected,
+                got: *got,
+            },
             Error::MeasurementDataTooShort => Error::MeasurementDataTooShort,
             Error::CleaningIntervalDataTooShort => Error::CleaningIntervalDataTooShort,
             Error::SerialInvalidUtf8 => Error::SerialInvalidUtf8,
             Error::ReadingEOF => Error::ReadingEOF,
             Error::FrameTooLarge => Error::FrameTooLarge,
+            Error::FrameTooShort => Error::FrameTooShort,
             Error::NoMeasurementsToRead => Error::NoMeasurementsToRead,
+            Error::InvalidCommand { command_code } => Error::InvalidCommand {
+                command_code: *command_code,
+            },
+            Error::DataLengthMissMatch => Error::DataLengthMissMatch,
         }
     }
 }
@@ -173,16 +212,31 @@ where
             (Error::SerialW(e), Error::SerialW(e2)) => e == e2,
             (Error::SHDLC(e), Error::SHDLC(e2)) => e == e2,
             (Error::DeviceError(s1), Error::DeviceError(s2)) => s1 == s2,
+            (
+                Error::InvalidResponse { expected, got },
+                Error::InvalidResponse {
+                    expected: expected_2,
+                    got: got_2,
+                },
+            ) => expected == expected_2 && got == got_2,
+            (Error::ClearingRxBuffer(e), Error::ClearingRxBuffer(e2)) => e == e2,
+            (
+                Error::InvalidCommand { command_code },
+                Error::InvalidCommand {
+                    command_code: command_code_2,
+                },
+            ) => command_code == command_code_2,
             (Error::InvalidFrame, Error::InvalidFrame)
             | (Error::EmptyResult, Error::EmptyResult)
             | (Error::ChecksumFailed, Error::ChecksumFailed)
-            | (Error::InvalidResponse, Error::InvalidResponse)
             | (Error::MeasurementDataTooShort, Error::MeasurementDataTooShort)
             | (Error::CleaningIntervalDataTooShort, Error::CleaningIntervalDataTooShort)
             | (Error::SerialInvalidUtf8, Error::SerialInvalidUtf8)
             | (Error::ReadingEOF, Error::ReadingEOF)
             | (Error::FrameTooLarge, Error::FrameTooLarge)
-            | (Error::NoMeasurementsToRead, Error::NoMeasurementsToRead) => true,
+            | (Error::FrameTooShort, Error::FrameTooShort)
+            | (Error::NoMeasurementsToRead, Error::NoMeasurementsToRead)
+            | (Error::DataLengthMissMatch, Error::DataLengthMissMatch) => true,
             (_, _) => false,
         }
     }

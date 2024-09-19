@@ -16,6 +16,7 @@ use core::{fmt, mem};
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_io_async::{Read, Write};
+use futures::{pin_mut, poll};
 use heapless::{String, Vec};
 
 mod error;
@@ -37,8 +38,10 @@ enum DeviceInfo {
     SerialNumber = 3,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Debug, defmt::Format, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
-enum Command {
+pub enum Command {
     StartMeasurement = 0,
     StopMeasurement = 1,
     ReadMeasuredData = 3,
@@ -47,6 +50,34 @@ enum Command {
     StartFanCleaning = 0x56,
     DeviceInformation = 0xD0,
     Reset = 0xD3,
+}
+
+macro_rules! cmd_try_from_u8 {
+    ($($cmd:expr),*) => {
+
+        impl TryFrom<u8> for Command {
+            type Error = u8;
+
+            fn try_from(value: u8) -> Result<Self, Self::Error> {
+
+                $(if value == $cmd as u8 {
+                    return Ok($cmd)
+                })*
+
+                Err(value)
+            }
+        }
+    }
+}
+
+cmd_try_from_u8! {
+    Command::StartMeasurement,
+    Command::StopMeasurement,
+    Command::ReadMeasuredData,
+    Command::ReadWriteAutoCleaningInterval,
+    Command::StartFanCleaning,
+    Command::DeviceInformation,
+    Command::Reset
 }
 
 #[derive(Debug)]
@@ -147,7 +178,7 @@ where
 {
     const ADDR: u8 = 0x00;
     let [ADDR, cmd, state, length, data @ .., check_sum] = frame else {
-        return Err(Error::InvalidResponse);
+        return Err(Error::FrameTooShort);
     };
     defmt::trace!("frame: {:?}", frame);
     defmt::trace!("cmd: {}, state: {}, length: {}", cmd, state, length);
@@ -160,8 +191,12 @@ where
         return Err(Error::ChecksumFailed);
     }
 
-    if *cmd != cmd_type as u8 {
-        return Err(Error::InvalidResponse);
+    let cmd = Command::try_from(*cmd).map_err(|_| Error::InvalidCommand { command_code: *cmd })?;
+    if cmd != cmd_type {
+        return Err(Error::InvalidResponse {
+            got: cmd,
+            expected: cmd_type,
+        });
     }
     if *state != 0 {
         let dev_err = DeviceError::from(*state);
@@ -169,7 +204,7 @@ where
     }
 
     if *length as usize != data.len() {
-        return Err(Error::InvalidResponse);
+        return Err(Error::DataLengthMissMatch);
     }
 
     Ok(data)
@@ -251,6 +286,10 @@ where
     #[inline(always)]
     async fn encode_and_send(&mut self, data: &[u8]) -> Result<(), Error<Tx::Error, Rx::Error>> {
         const LARGEST_ENCODED_REQUEST_FRAME: usize = 2 * (2 + 4 + 2); // header, data, footer
+        self.clear_rx_buffer()
+            .await
+            .map_err(Error::ClearingRxBuffer)?;
+
         let output = hldc::encode::<LARGEST_ENCODED_REQUEST_FRAME>(data)
             .await
             .unwrap();
@@ -291,11 +330,9 @@ where
         const SUBCMD: u8 = 0x01;
         const FORMAT_FLOAT: u8 = 0x03;
         let cmd = cmd!(CMD, [SUBCMD, FORMAT_FLOAT]);
-        defmt::info!("requesting start measurement");
         self.encode_and_send(&cmd).await?;
 
         let response = self.receive_and_decode().await?;
-        defmt::debug!("checking response");
         check_miso_frame(&response, CMD)
     }
 
@@ -434,11 +471,7 @@ where
 
         let response = self.receive_and_decode().await?;
         check_miso_frame(&response, CMD)?;
-        if response[3] != 0 {
-            Err(Error::InvalidResponse)
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     /// Start fan cleaning manually. This will accelerate the fan to maximum
@@ -492,16 +525,32 @@ where
     /// These are caught and reported as Errors.
     #[inline(always)]
     pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
-        defmt::info!("resetting device");
         const CMD: Command = Command::Reset;
         let cmd = cmd!(CMD);
         self.encode_and_send(&cmd).await?;
 
         let response = self.receive_and_decode().await?;
-        defmt::debug!("checking response");
         check_miso_frame(&response, CMD)?;
         self.delay.delay_ms(20).await;
-        defmt::debug!("reset done");
         Ok(())
+    }
+
+    async fn clear_rx_buffer(&mut self) -> Result<(), Rx::Error> {
+        // effectively do a try_read throwing the result away immediately
+        let mut buf = [0u8; 20];
+        let buf_len = buf.len();
+
+        loop {
+            let read_future = self.uart_rx.read(&mut buf);
+            pin_mut!(read_future);
+
+            // by polling once we get the data that is immediately ready
+            // (the data in the buffer) or Pending meaning the buffer is empty
+            match poll!(read_future) {
+                core::task::Poll::Ready(Ok(n)) if n == buf_len => continue,
+                core::task::Poll::Ready(Err(e)) => return Err(e),
+                _ => return Ok(()),
+            }
+        }
     }
 }

@@ -61,7 +61,6 @@ where
         };
         defmt::trace!("marker before that: {}", before_last);
         defmt::trace!("last - before last: {}", last_marker - before_last);
-        defmt::trace!("hldc::MIN_FRAME_SIZE: {}", hldc::MIN_FRAME_SIZE);
 
         if last_marker - before_last >= hldc::MIN_FRAME_SIZE {
             if last_marker == read.len() - 1 {
