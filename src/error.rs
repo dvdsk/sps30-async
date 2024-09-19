@@ -62,14 +62,17 @@ where
     RxError: defmt::Format + fmt::Debug,
 {
     /// Serial bus read error
-    #[cfg_attr(feature = "thiserror", error("Serial bus read error"))]
+    #[cfg_attr(feature = "thiserror", error("Serial bus read error: {0}"))]
     SerialR(RxError),
     /// Serial bus write error
-    #[cfg_attr(feature = "thiserror", error("Serial bus write error"))]
+    #[cfg_attr(feature = "thiserror", error("Serial bus write error: {0}"))]
     SerialW(TxError),
     /// SHDLC decode error
-    #[cfg_attr(feature = "thiserror", error("SHDLC decode error"))]
+    #[cfg_attr(feature = "thiserror", error("SHDLC decode error: {0}"))]
     SHDLC(crate::hldc::Error),
+    /// Device returned an error
+    #[cfg_attr(feature = "thiserror", error("Device returned error: {0}"))]
+    DeviceError(DeviceError),
     /// No valid frame read. Input function read more than twice the max bytes
     /// in a frame without seeing frame markers
     #[cfg_attr(
@@ -83,7 +86,7 @@ in a frame without seeing frame markers"
     /// Result is empty
     #[cfg_attr(feature = "thiserror", error("Result is empty"))]
     EmptyResult,
-    /// Checksum failed, after shdlc decode
+    /// Checksum failed, after SHDLC decode
     #[cfg_attr(feature = "thiserror", error("Checksum failed, after shdlc decode"))]
     ChecksumFailed,
     /// Response is for another command then what we send
@@ -92,9 +95,6 @@ in a frame without seeing frame markers"
         error("Response is for another Command then what we send")
     )]
     InvalidResponse,
-    /// Device returned an error
-    #[cfg_attr(feature = "thiserror", error("Device returned error: {0}"))]
-    DeviceError(DeviceError),
     /// The data send in response to read measurement was too short
     #[cfg_attr(
         feature = "thiserror",
@@ -122,6 +122,12 @@ in a frame without seeing frame markers"
         error("Frame is too large, either a bug or something went wrong with uart.")
     )]
     FrameTooLarge,
+    /// The sensor should have a measurement ready within 2 seconds it did not
+    #[cfg_attr(
+        feature = "thiserror",
+        error("The sensor should have a measurement ready within 2 seconds it did not")
+    )]
+    NoMeasurementsToRead,
 }
 
 impl<TxError, RxError> Clone for Error<TxError, RxError>
@@ -134,16 +140,17 @@ where
             Error::SerialR(e) => Error::SerialR(e.clone()),
             Error::SerialW(e) => Error::SerialW(e.clone()),
             Error::SHDLC(e) => Error::SHDLC(e.clone()),
+            Error::DeviceError(s) => Error::DeviceError(s.clone()),
             Error::InvalidFrame => Error::InvalidFrame,
             Error::EmptyResult => Error::EmptyResult,
             Error::ChecksumFailed => Error::ChecksumFailed,
             Error::InvalidResponse => Error::InvalidResponse,
-            Error::DeviceError(s) => Error::DeviceError(s.clone()),
             Error::MeasurementDataTooShort => Error::MeasurementDataTooShort,
             Error::CleaningIntervalDataTooShort => Error::CleaningIntervalDataTooShort,
             Error::SerialInvalidUtf8 => Error::SerialInvalidUtf8,
             Error::ReadingEOF => Error::ReadingEOF,
             Error::FrameTooLarge => Error::FrameTooLarge,
+            Error::NoMeasurementsToRead => Error::NoMeasurementsToRead,
         }
     }
 }
@@ -167,13 +174,15 @@ where
             (Error::SHDLC(e), Error::SHDLC(e2)) => e == e2,
             (Error::DeviceError(s1), Error::DeviceError(s2)) => s1 == s2,
             (Error::InvalidFrame, Error::InvalidFrame)
-            | (Error::FrameTooLarge, Error::FrameTooLarge)
-            | (Error::ReadingEOF, Error::ReadingEOF)
             | (Error::EmptyResult, Error::EmptyResult)
             | (Error::ChecksumFailed, Error::ChecksumFailed)
+            | (Error::InvalidResponse, Error::InvalidResponse)
+            | (Error::MeasurementDataTooShort, Error::MeasurementDataTooShort)
             | (Error::CleaningIntervalDataTooShort, Error::CleaningIntervalDataTooShort)
             | (Error::SerialInvalidUtf8, Error::SerialInvalidUtf8)
-            | (Error::MeasurementDataTooShort, Error::MeasurementDataTooShort) => true,
+            | (Error::ReadingEOF, Error::ReadingEOF)
+            | (Error::FrameTooLarge, Error::FrameTooLarge)
+            | (Error::NoMeasurementsToRead, Error::NoMeasurementsToRead) => true,
             (_, _) => false,
         }
     }

@@ -132,7 +132,7 @@ macro_rules! cmd {
     };
 }
 
-/// Perform checks on decoded MISO Frame
+/// Perform checks on decoded MISO Frame, returns data
 ///
 /// Start
 ///  ADR     CMD       State    Length    RX Data          CHK     Stop      
@@ -291,9 +291,11 @@ where
         const SUBCMD: u8 = 0x01;
         const FORMAT_FLOAT: u8 = 0x03;
         let cmd = cmd!(CMD, [SUBCMD, FORMAT_FLOAT]);
+        defmt::info!("requesting start measurement");
         self.encode_and_send(&cmd).await?;
 
         let response = self.receive_and_decode().await?;
+        defmt::debug!("checking response");
         check_miso_frame(&response, CMD)
     }
 
@@ -315,8 +317,38 @@ where
         }
     }
 
-    /// Read result. If no new measurement values are available, the module
-    /// waits until one is. The measurement interval is 1 second.
+    /// Try to read the measurement result. If no new measurement values are
+    /// available this returns None. The measurement interval is 1 second.
+    ///
+    /// This function like all in this driver is cancel safe
+    ///
+    /// # Errors
+    /// Reading the response can fail, the device can run into an internal
+    /// error or the connection could have issues leading to invalid responses.
+    /// These are caught and reported as Errors.
+    #[inline(always)]
+    pub async fn poll_read_measurement(
+        &mut self,
+    ) -> Result<Option<Measurement>, Error<Tx::Error, Rx::Error>> {
+        const CMD: Command = Command::ReadMeasuredData;
+        let cmd = cmd!(CMD);
+        self.encode_and_send(&cmd).await?;
+
+        let response = self.receive_and_decode().await?;
+        let data = parse_miso_frame(&response, CMD)?;
+
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort)?,
+        ))
+    }
+
+    /// Read the measurement result. If no new measurement values are available
+    /// this retries up to twice the measurement interval before returning an error.
+    /// The default measurement interval is 1s.
     ///
     /// This function like all in this driver is cancel safe
     ///
@@ -328,11 +360,22 @@ where
     pub async fn read_measurement(&mut self) -> Result<Measurement, Error<Tx::Error, Rx::Error>> {
         const CMD: Command = Command::ReadMeasuredData;
         let cmd = cmd!(CMD);
-        self.encode_and_send(&cmd).await?;
 
-        let data = self.receive_and_decode().await?;
-        check_miso_frame(&data, CMD)?;
-        Ok(Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort)?)
+        for _attempt in 0..20 {
+            self.encode_and_send(&cmd).await?;
+
+            let response = self.receive_and_decode().await?;
+            let data = parse_miso_frame(&response, CMD)?;
+
+            if data.is_empty() {
+                self.delay.delay_ms(100).await;
+                continue;
+            } else {
+                return Measurement::from_data(&data).map_err(|_| Error::MeasurementDataTooShort);
+            }
+        }
+
+        Err(Error::NoMeasurementsToRead)
     }
 
     /// Read cleaning interval, of the periodic fan-cleaning. Interval in
@@ -449,13 +492,16 @@ where
     /// These are caught and reported as Errors.
     #[inline(always)]
     pub async fn reset(&mut self) -> Result<(), Error<Tx::Error, Rx::Error>> {
+        defmt::info!("resetting device");
         const CMD: Command = Command::Reset;
         let cmd = cmd!(CMD);
         self.encode_and_send(&cmd).await?;
 
         let response = self.receive_and_decode().await?;
+        defmt::debug!("checking response");
         check_miso_frame(&response, CMD)?;
         self.delay.delay_ms(20).await;
+        defmt::debug!("reset done");
         Ok(())
     }
 }
