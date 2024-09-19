@@ -1,7 +1,7 @@
-use embedded_io_async::Read;
+use embedded_io_async::{Read, ReadReady};
 use heapless::Vec;
 
-use crate::hldc;
+use crate::{hldc, MAX_ENCODED_FRAME_SIZE};
 
 // TODO in future versions use use ReadReady trait to remove need for huge UART buffer
 // currently ReadReady is not implemented by most hall implementations
@@ -13,16 +13,19 @@ use crate::hldc;
 /// reject old frame if start of a newer read has been read
 ///  - any trailing character invalidates previous package
 ///
-pub(crate) async fn read_frame<const UART_BUF_SIZE: usize, const FRAME_CAPACITY: usize, Rx>(
+pub(crate) async fn read_frame<Rx>(
     rx: &mut Rx,
-) -> Result<Vec<u8, FRAME_CAPACITY>, Error<Rx::Error>>
+) -> Result<Vec<u8, MAX_ENCODED_FRAME_SIZE>, Error<Rx::Error>>
 where
-    Rx: Read,
+    Rx: Read + ReadReady,
     Rx::Error: defmt::Format,
 {
-    let mut frame: Vec<u8, FRAME_CAPACITY> = Vec::new();
-    // MUST be larger then any existing uart buffer
-    let mut buf = [0u8; UART_BUF_SIZE];
+    let mut frame: Vec<u8, MAX_ENCODED_FRAME_SIZE> = Vec::new();
+    // MUST be larger then any existing uart buffer such that we can
+    // be sure we have read everything and the current package is the
+    // most up to date one. We can replace that use with read_ready which
+    // tests if the uart has more bytes ready for us.
+    let mut buf = [0u8; 20];
     let mut read;
 
     loop {
@@ -47,7 +50,7 @@ where
         };
 
         defmt::trace!("last_marker: {}", last_marker);
-        let Some(before_last) = read[..last_marker]
+        let Some(second_last) = read[..last_marker]
             .iter()
             .rposition(|byte| *byte == hldc::FRAME_BOUNDARY_MARKER)
         else {
@@ -59,15 +62,15 @@ where
                 FindEndResult::ReadError(err) => return Err(err),
             }
         };
-        defmt::trace!("marker before that: {}", before_last);
-        defmt::trace!("last - before last: {}", last_marker - before_last);
+        defmt::trace!("marker before that: {}", second_last);
+        defmt::trace!("last - before last: {}", last_marker - second_last);
         defmt::trace!("hldc::MIN_FRAME_SIZE: {}", hldc::MIN_FRAME_SIZE);
 
-        if last_marker - before_last >= hldc::MIN_FRAME_SIZE {
+        if last_marker - second_last >= hldc::MIN_FRAME_SIZE {
             if last_marker == read.len() - 1 {
                 // full package inside buffer, no trailing characters
                 frame.clear();
-                frame.extend_from_slice(&read[before_last..=last_marker])?;
+                frame.extend_from_slice(&read[second_last..=last_marker])?;
                 return Ok(frame);
             }
             // got bytes past complete package, reject
@@ -124,7 +127,7 @@ async fn find_end<const B: usize, const FRAME_CAPACITY: usize, Rx>(
     buf: &mut [u8; B],
 ) -> FindEndResult<Rx::Error>
 where
-    Rx: Read,
+    Rx: Read + ReadReady,
     Rx::Error: defmt::Format,
 {
     let mut read;
@@ -147,7 +150,12 @@ where
         }
     };
 
-    if boundary == read.len() - 1 {
+    let read_ready = match rx.read_ready(){
+        Ok(is_ready) => is_ready,
+        Err(e) => return FindEndResult::ReadError(Error::Read(e))
+    };
+
+    if boundary == read.len() - 1 && !read_ready {
         if let Err(()) = frame.extend_from_slice(read) {
             return FindEndResult::ReadError(Error::BufferOutOfSpace);
         }

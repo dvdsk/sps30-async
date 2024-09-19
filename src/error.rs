@@ -62,21 +62,21 @@ where
     RxError: defmt::Format + fmt::Debug,
 {
     /// Serial bus read error
-    #[cfg_attr(feature = "thiserror", error("Serial bus read error"))]
+    #[cfg_attr(feature = "thiserror", error("Serial bus read error: {0}"))]
     SerialR(RxError),
     /// Serial bus write error
-    #[cfg_attr(feature = "thiserror", error("Serial bus write error"))]
+    #[cfg_attr(feature = "thiserror", error("Serial bus write error: {0}"))]
     SerialW(TxError),
     /// SHDLC decode error
-    #[cfg_attr(feature = "thiserror", error("SHDLC decode error"))]
+    #[cfg_attr(feature = "thiserror", error("SHDLC decode error: {0}"))]
     SHDLC(crate::hldc::Error),
     /// No valid frame read. Input function read more than twice the max bytes
     /// in a frame without seeing frame markers
     #[cfg_attr(
         feature = "thiserror",
         error(
-            "No valid frame read. Input function read more than twice the max bytes
-in a frame without seeing frame markers"
+            "No valid frame read. Input function read more than \
+            twice the max bytes in a frame without seeing frame markers"
         )
     )]
     InvalidFrame,
@@ -122,6 +122,12 @@ in a frame without seeing frame markers"
         error("Frame is too large, either a bug or something went wrong with uart.")
     )]
     FrameTooLarge,
+    /// Could not send the Low pulse to wake-up the uart-interface
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Could not send the Low pulse to wake-up the uart-interface: {0}")
+    )]
+    SendingWakeupPulse(TxError),
 }
 
 impl<TxError, RxError> Clone for Error<TxError, RxError>
@@ -144,6 +150,7 @@ where
             Error::SerialInvalidUtf8 => Error::SerialInvalidUtf8,
             Error::ReadingEOF => Error::ReadingEOF,
             Error::FrameTooLarge => Error::FrameTooLarge,
+            Error::SendingWakeupPulse(e) => Error::SendingWakeupPulse(e.clone()),
         }
     }
 }
